@@ -57,7 +57,8 @@ total 4   dirty 1   unpushed 1   clean 0   broken 1
 ```
 
 Colors appear only in a real terminal; they turn off automatically when
-output is piped or when `NO_COLOR` is set.
+output is piped or when `NO_COLOR` is set. Force either way with
+`REPOSWEEP_COLOR=always` or `REPOSWEEP_COLOR=never`.
 
 ## Guarantees
 

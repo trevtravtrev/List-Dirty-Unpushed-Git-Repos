@@ -105,21 +105,28 @@ def _color_enabled() -> bool:
     return sys.stdout.isatty()
 
 
-def _enable_ansi_windows() -> None:
-    """Turn on virtual-terminal (ANSI) processing for Windows console handles."""
+def _enable_ansi_windows() -> bool:
+    """Turn on virtual-terminal (ANSI) processing for Windows console handles.
+
+    Returns False only when a real console rejected the VT flag, in which case
+    color must be disabled or raw escapes would print as text.
+    """
     if sys.platform != "win32":
-        return
+        return True
     try:
         import ctypes
 
         k32 = ctypes.windll.kernel32
+        enabled = True
         for std_handle in (-11, -12):  # stdout, stderr
             handle = k32.GetStdHandle(std_handle)
             mode = ctypes.c_uint32()
             if k32.GetConsoleMode(handle, ctypes.byref(mode)):
-                k32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                if not k32.SetConsoleMode(handle, mode.value | 0x0004):  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    enabled = False
+        return enabled
     except Exception:
-        pass  # not a real console: escapes would just be filtered upstream
+        return True  # not a real console: color is off upstream anyway
 
 
 def sweep_repo(path: str) -> dict:
@@ -224,7 +231,9 @@ def _fmt_repo(c: _Color, r: dict, name_w: int, branch_w: int) -> str:
     if len(name) > name_w:
         name = name[: name_w - 3] + "..."
     branch = r["branch"] or "?"
-    dirty = "?" if r["dirty"] is None else str(r["dirty"])
+    if len(branch) > branch_w:
+        branch = branch[: branch_w - 3] + "..."
+    dirty = "?" if r["dirty"] is None else (str(r["dirty"]) if r["dirty"] < 10000 else "9999+")
     unpushed = (
         "?" if r["unpushed"] is None
         else str(r["unpushed"]) if isinstance(r["unpushed"], int)
@@ -360,7 +369,8 @@ def main(argv=None) -> int:
     n_work = sum(1 for r in results if _has_work(r))
 
     c = _Color(_color_enabled())
-    _enable_ansi_windows()
+    if c.enabled and sys.platform == "win32":
+        c = _Color(_enable_ansi_windows())
     name_w = max(10, min(30, max((len(r["name"]) for r in shown), default=10)))
     branch_w = max(8, min(24, max((len(r["branch"] or "") for r in shown), default=8)))
 
