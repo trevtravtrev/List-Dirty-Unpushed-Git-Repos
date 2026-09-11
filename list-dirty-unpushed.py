@@ -11,6 +11,9 @@ Strictly read-only: only runs rev-parse / status / rev-list / log, with
 GIT_OPTIONAL_LOCKS=0 so even optional index refresh is skipped. Never
 crashes on broken repos; those get an [error: ...] note instead.
 
+Output is an aligned, colorized table when run in a terminal; colors turn
+off automatically when piped or when NO_COLOR is set.
+
 Usage:
     python list-dirty-unpushed.py [--dir PATH] [--all] [--json]
 """
@@ -69,6 +72,54 @@ def _note(stderr: str, fallback: str) -> str:
         if line:
             return (line[: NOTE_MAX] + "...") if len(line) > NOTE_MAX else line
     return fallback
+
+
+class _Color:
+    """ANSI 16-color palette; every method is a no-op when disabled."""
+
+    BOLD = "1"
+    DIM = "90"
+    RED = "31"
+    GREEN = "32"
+    YELLOW = "33"
+    CYAN = "36"
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def paint(self, text: str, *codes: str) -> str:
+        if not self.enabled or not codes:
+            return text
+        return "\x1b[" + ";".join(codes) + "m" + text + "\x1b[0m"
+
+
+def _color_enabled() -> bool:
+    """Auto: color on a TTY. NO_COLOR disables; REPOSWEEP_COLOR forces either way."""
+    override = os.environ.get("REPOSWEEP_COLOR", "").strip().lower()
+    if override in ("always", "1", "true", "yes"):
+        return True
+    if override in ("never", "0", "false", "no"):
+        return False
+    if "NO_COLOR" in os.environ:
+        return False
+    return sys.stdout.isatty()
+
+
+def _enable_ansi_windows() -> None:
+    """Turn on virtual-terminal (ANSI) processing for Windows console handles."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        for std_handle in (-11, -12):  # stdout, stderr
+            handle = k32.GetStdHandle(std_handle)
+            mode = ctypes.c_uint32()
+            if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                k32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass  # not a real console: escapes would just be filtered upstream
 
 
 def sweep_repo(path: str) -> dict:
@@ -168,17 +219,76 @@ def _sort_key(r: dict) -> tuple:
     return (group, rank, r["name"])
 
 
-def _fmt_repo(r: dict) -> str:
-    line = (
-        f"{r['name']}  "
-        f"branch={r['branch'] or '?'}  "
-        f"dirty={'?' if r['dirty'] is None else r['dirty']}  "
-        f"unpushed={'?' if r['unpushed'] is None else r['unpushed']}  "
-        f"last={'?' if r['last_commit_days'] is None else str(r['last_commit_days']) + 'd'}"
+def _fmt_repo(c: _Color, r: dict, name_w: int, branch_w: int) -> str:
+    name = r["name"]
+    if len(name) > name_w:
+        name = name[: name_w - 3] + "..."
+    branch = r["branch"] or "?"
+    dirty = "?" if r["dirty"] is None else str(r["dirty"])
+    unpushed = (
+        "?" if r["unpushed"] is None
+        else str(r["unpushed"]) if isinstance(r["unpushed"], int)
+        else r["unpushed"]
     )
+    last = "?" if r["last_commit_days"] is None else f"{r['last_commit_days']}d"
+
+    name_cell = c.paint(name.ljust(name_w), c.BOLD)
+    branch_cell = c.paint(branch.ljust(branch_w), c.CYAN)
+    dirty_cell = (
+        c.paint(dirty.rjust(5), c.RED) if (r["dirty"] or 0) > 0
+        else c.paint(dirty.rjust(5), c.DIM)
+    )
+    if isinstance(r["unpushed"], int) and r["unpushed"] > 0:
+        unpushed_cell = c.paint(unpushed.rjust(12), c.YELLOW)
+    else:
+        unpushed_cell = c.paint(unpushed.rjust(12), c.DIM)
+    days = r["last_commit_days"]
+    if days is None or days < 30:
+        last_cell = c.paint(last.rjust(5), c.DIM)
+    elif days < 90:
+        last_cell = c.paint(last.rjust(5), c.YELLOW)
+    else:
+        last_cell = c.paint(last.rjust(5), c.RED)
+
+    line = f"{name_cell}  {branch_cell}  {dirty_cell}  {unpushed_cell}  {last_cell}"
     if r["error"]:
-        line += f"  [error: {r['error']}]"
+        line += "  " + c.paint(f"[error: {r['error']}]", c.RED)
     return line
+
+
+def _fmt_header(c: _Color, dir_path: str, name_w: int, branch_w: int, hidden_clean: int) -> list:
+    lines = [c.paint(f"folder: {dir_path}", c.DIM)]
+    header = (
+        f"{'NAME'.ljust(name_w)}  {'BRANCH'.ljust(branch_w)}"
+        f"  {'DIRTY'.rjust(5)}  {'UNPUSHED'.rjust(12)}  {'LAST'.rjust(5)}"
+    )
+    lines.append(c.paint(header, c.BOLD, c.DIM))
+    if hidden_clean > 0:
+        lines.append(c.paint(
+            f"{hidden_clean} fully clean repo(s) hidden - use --all to show them",
+            c.DIM,
+        ))
+    return lines
+
+
+def _fmt_summary(c: _Color, name_w: int, branch_w: int, total: int, n_dirty: int,
+                 n_unpushed: int, n_clean: int, n_error: int, n_work: int) -> list:
+    ruler = c.paint("-" * (name_w + branch_w + 30), c.DIM)
+    counts = (
+        f"{c.paint('total', c.DIM)} {c.paint(str(total), c.BOLD)}   "
+        f"{c.paint('dirty', c.DIM)} {c.paint(str(n_dirty), c.RED if n_dirty else c.DIM)}   "
+        f"{c.paint('unpushed', c.DIM)} {c.paint(str(n_unpushed), c.YELLOW if n_unpushed else c.DIM)}   "
+        f"{c.paint('clean', c.DIM)} {c.paint(str(n_clean), c.GREEN if n_clean else c.DIM)}"
+    )
+    if n_error:
+        counts += f"   {c.paint('broken', c.DIM)} {c.paint(str(n_error), c.RED)}"
+    if total == 0:
+        verdict = c.paint("no git repos found", c.DIM)
+    elif n_work == 0:
+        verdict = c.paint("all clear - no dangling work", c.GREEN)
+    else:
+        verdict = c.paint(f"{n_work} of {total} repos have dangling work", c.BOLD)
+    return [ruler, counts, verdict]
 
 
 def main(argv=None) -> int:
@@ -238,9 +348,6 @@ def main(argv=None) -> int:
         print(json.dumps(shown, ensure_ascii=False))
         return 0
 
-    for r in shown:
-        print(_fmt_repo(r))
-
     total = len(results)
     n_dirty = sum(1 for r in results if (r["dirty"] or 0) > 0)
     n_unpushed = sum(1 for r in results if isinstance(r["unpushed"], int) and r["unpushed"] > 0)
@@ -252,14 +359,20 @@ def main(argv=None) -> int:
     )
     n_work = sum(1 for r in results if _has_work(r))
 
-    line1 = f"total={total}  dirty={n_dirty}  unpushed={n_unpushed}  clean={n_clean}"
-    if n_error:
-        line1 += f"  errors={n_error}"
-    print(line1)
-    if total:
-        print(f"{n_work} of {total} repos have dangling work")
-    else:
-        print("no git repos found")
+    c = _Color(_color_enabled())
+    _enable_ansi_windows()
+    name_w = max(10, min(30, max((len(r["name"]) for r in shown), default=10)))
+    branch_w = max(8, min(24, max((len(r["branch"] or "") for r in shown), default=8)))
+
+    for line in _fmt_header(c, args.dir, name_w, branch_w, hidden_clean=total - len(shown)):
+        print(line)
+    for r in shown:
+        print(_fmt_repo(c, r, name_w, branch_w))
+    for line in _fmt_summary(
+        c, name_w, branch_w, total=total, n_dirty=n_dirty, n_unpushed=n_unpushed,
+        n_clean=n_clean, n_error=n_error, n_work=n_work,
+    ):
+        print(line)
     return 0
 
 
